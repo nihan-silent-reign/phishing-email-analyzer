@@ -1,0 +1,751 @@
+
+import re
+import sys
+import ipaddress
+from email import policy
+from email.parser import BytesParser
+from urllib.parse import urlparse
+from bs4 import BeautifulSoup
+# ============================================================
+# PHISHING EMAIL DETECTOR
+# SPF + DKIM + DMARC + HEADER + URL + PUNYCODE +
+# TYPOSQUATTING + ATTACHMENT + SOCIAL ENGINEERING
+# ============================================================
+# ------------------------------------------------------------
+# Known brands for basic typosquatting detection
+# ------------------------------------------------------------
+KNOWN_BRANDS = {
+    "google": ["google.com"],
+    "microsoft": ["microsoft.com"],
+    "apple": ["apple.com"],
+    "amazon": ["amazon.com"],
+    "paypal": ["paypal.com"],
+    "facebook": ["facebook.com", "fb.com"],
+    "instagram": ["instagram.com"],
+    "linkedin": ["linkedin.com"],
+    "netflix": ["netflix.com"],
+    "github": ["github.com"],
+    "dropbox": ["dropbox.com"],
+    "docusign": ["docusign.com"],
+    "outlook": ["outlook.com"],
+    "office": ["office.com"],
+}
+# ------------------------------------------------------------
+# Suspicious URL shorteners
+# ------------------------------------------------------------
+URL_SHORTENERS = {
+    "bit.ly",
+    "tinyurl.com",
+    "t.co",
+    "goo.gl",
+    "ow.ly",
+    "is.gd",
+    "buff.ly",
+    "cutt.ly",
+    "shorturl.at",
+}
+# ------------------------------------------------------------
+# Dangerous attachment extensions
+# ------------------------------------------------------------
+DANGEROUS_EXTENSIONS = {
+    ".exe",
+    ".scr",
+    ".bat",
+    ".cmd",
+    ".com",
+    ".msi",
+    ".js",
+    ".vbs",
+    ".vbe",
+    ".ps1",
+    ".psm1",
+    ".hta",
+    ".jar",
+    ".iso",
+    ".img",
+    ".lnk",
+    ".reg",
+}
+# ------------------------------------------------------------
+# Social engineering keywords
+# ------------------------------------------------------------
+SOCIAL_ENGINEERING_PATTERNS = {
+    "Urgency": [
+        "urgent",
+        "immediately",
+        "act now",
+        "action required",
+        "within 24 hours",
+        "within 48 hours",
+        "last warning",
+        "final warning",
+        "respond immediately",
+    ],
+    "Account Threat": [
+        "account will be suspended",
+        "account suspended",
+        "account disabled",
+        "account locked",
+        "verify your account",
+        "confirm your account",
+        "unusual activity",
+        "suspicious activity",
+    ],
+    "Credential Theft": [
+        "verify your password",
+        "confirm your password",
+        "login",
+        "sign in",
+        "verify identity",
+        "confirm identity",
+        "update your password",
+        "password expired",
+    ],
+    "Financial Pressure": [
+        "payment required",
+        "payment failed",
+        "invoice",
+        "refund",
+        "bank account",
+        "credit card",
+        "wire transfer",
+        "payment information",
+    ],
+    "Prize / Reward": [
+        "you have won",
+        "winner",
+        "claim your prize",
+        "free gift",
+        "reward waiting",
+    ],
+}
+# ============================================================
+# Utility functions
+# ============================================================
+def add_finding(findings, category, severity, message):
+    findings.append({
+        "category": category,
+        "severity": severity,
+        "message": message
+    })
+def normalize_domain(domain):
+    if not domain:
+        return ""
+    domain = domain.lower().strip()
+    if domain.startswith("www."):
+        domain = domain[4:]
+    return domain
+def get_domain_from_email(email_address):
+    match = re.search(r"@([^>\s]+)", email_address or "")
+    if match:
+        return normalize_domain(match.group(1))
+    return ""
+def get_domain_from_url(url):
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if hostname:
+            return normalize_domain(hostname)
+    except Exception:
+        pass
+    return ""
+# ============================================================
+# Levenshtein distance
+# Used for basic typosquatting detection
+# ============================================================
+def levenshtein_distance(a, b):
+    if len(a) < len(b):
+        return levenshtein_distance(b, a)
+    if len(b) == 0:
+        return len(a)
+    previous_row = list(range(len(b) + 1))
+    for i, char_a in enumerate(a, start=1):
+        current_row = [i]
+        for j, char_b in enumerate(b, start=1):
+            insertions = current_row[j - 1] + 1
+            deletions = previous_row[j] + 1
+            substitutions = previous_row[j - 1] + (char_a != char_b)
+            current_row.append(
+                min(insertions, deletions, substitutions)
+            )
+        previous_row = current_row
+    return previous_row[-1]
+# ============================================================
+# Parse authentication results
+# ============================================================
+def analyze_authentication(msg, findings):
+    authentication_results = (
+        msg.get("Authentication-Results", "")
+        or ""
+    ).lower()
+    received_spf = (
+        msg.get("Received-SPF", "")
+        or ""
+    ).lower()
+    # ---------------- SPF ----------------
+    if "spf=pass" in authentication_results or "spf=pass" in received_spf:
+        print("[+] SPF: PASS")
+    elif "spf=fail" in authentication_results or "spf=fail" in received_spf:
+        add_finding(
+            findings,
+            "SPF",
+            "HIGH",
+            "SPF failed."
+        )
+        print("[!] SPF: FAIL")
+    elif "spf=softfail" in authentication_results:
+        add_finding(
+            findings,
+            "SPF",
+            "MEDIUM",
+            "SPF softfail detected."
+        )
+        print("[!] SPF: SOFTFAIL")
+    else:
+        add_finding(
+            findings,
+            "SPF",
+            "LOW",
+            "SPF result could not be verified from the email headers."
+        )
+        print("[?] SPF: UNKNOWN")
+    # ---------------- DKIM ----------------
+    if "dkim=pass" in authentication_results:
+        print("[+] DKIM: PASS")
+    elif "dkim=fail" in authentication_results:
+        add_finding(
+            findings,
+            "DKIM",
+            "HIGH",
+            "DKIM authentication failed."
+        )
+        print("[!] DKIM: FAIL")
+    else:
+        add_finding(
+            findings,
+            "DKIM",
+            "LOW",
+            "DKIM result could not be verified from the email headers."
+        )
+        print("[?] DKIM: UNKNOWN")
+    # ---------------- DMARC ----------------
+    if "dmarc=pass" in authentication_results:
+        print("[+] DMARC: PASS")
+    elif "dmarc=fail" in authentication_results:
+        add_finding(
+            findings,
+            "DMARC",
+            "HIGH",
+            "DMARC authentication failed."
+        )
+        print("[!] DMARC: FAIL")
+    else:
+        add_finding(
+            findings,
+            "DMARC",
+            "LOW",
+            "DMARC result could not be verified from the email headers."
+        )
+        print("[?] DMARC: UNKNOWN")
+# ============================================================
+# Header analysis
+# ============================================================
+def analyze_headers(msg, findings):
+    from_header = msg.get("From", "")
+    reply_to = msg.get("Reply-To", "")
+    return_path = msg.get("Return-Path", "")
+    print("\n--- HEADER ANALYSIS ---")
+    print("From       :", from_header)
+    print("Reply-To   :", reply_to)
+    print("Return-Path:", return_path)
+    from_domain = get_domain_from_email(from_header)
+    reply_domain = get_domain_from_email(reply_to)
+    return_domain = get_domain_from_email(return_path)
+    # From vs Reply-To
+    if reply_domain and from_domain:
+        if reply_domain != from_domain:
+            add_finding(
+                findings,
+                "HEADER",
+                "HIGH",
+                f"From domain ({from_domain}) differs from Reply-To domain ({reply_domain})."
+            )
+    # From vs Return-Path
+    if return_domain and from_domain:
+        if return_domain != from_domain:
+            add_finding(
+                findings,
+                "HEADER",
+                "MEDIUM",
+                f"From domain ({from_domain}) differs from Return-Path ({return_domain})."
+            )
+    # Received headers
+    received_headers = msg.get_all("Received", [])
+    print("Received headers:", len(received_headers))
+    if not received_headers:
+        add_finding(
+            findings,
+            "HEADER",
+            "LOW",
+            "No Received headers were found."
+        )
+# ============================================================
+# Punycode detection
+# ============================================================
+def analyze_punycode(domain, findings):
+    if "xn--" in domain.lower():
+        add_finding(
+            findings,
+            "PUNYCODE",
+            "HIGH",
+            f"Punycode domain detected: {domain}"
+        )
+        return True
+    return False
+# ============================================================
+# Typosquatting detection
+# ============================================================
+def analyze_typosquatting(domain, findings):
+    if not domain:
+        return
+    domain_without_www = normalize_domain(domain)
+    for brand, official_domains in KNOWN_BRANDS.items():
+        # Check exact official domain first
+        if domain_without_www in official_domains:
+            continue
+        # Extract first part of domain
+        base = domain_without_www.split(".")[0]
+        distance = levenshtein_distance(
+            base,
+            brand
+        )
+        # Very close spelling
+        if distance <= 2:
+            add_finding(
+                findings,
+                "TYPOSQUATTING",
+                "HIGH",
+                f"Domain '{domain}' is suspiciously similar to '{brand}'."
+            )
+            return
+        # Brand contained inside suspicious domain
+        if brand in base and base != brand:
+            add_finding(
+                findings,
+                "TYPOSQUATTING",
+                "MEDIUM",
+                f"Domain '{domain}' contains the brand name '{brand}'."
+            )
+            return
+# ============================================================
+# URL analysis
+# ============================================================
+def analyze_url(url, findings):
+    url = url.strip()
+    domain = get_domain_from_url(url)
+    if not domain:
+        return
+    # ---------------- HTTPS ----------------
+    if url.lower().startswith("http://"):
+        add_finding(
+            findings,
+            "URL",
+            "MEDIUM",
+            f"URL does not use HTTPS: {url}"
+        )
+    # ---------------- IP address ----------------
+    try:
+        ipaddress.ip_address(domain)
+        add_finding(
+            findings,
+            "URL",
+            "HIGH",
+            f"URL uses an IP address instead of a domain: {url}"
+        )
+    except ValueError:
+        pass
+    # ---------------- URL shortener ----------------
+    if domain in URL_SHORTENERS:
+        add_finding(
+            findings,
+            "URL",
+            "MEDIUM",
+            f"URL shortener detected: {domain}"
+        )
+    # ---------------- Punycode ----------------
+    analyze_punycode(
+        domain,
+        findings
+    )
+    # ---------------- Typosquatting ----------------
+    analyze_typosquatting(
+        domain,
+        findings
+    )
+    # ---------------- Suspicious @ symbol ----------------
+    if "@" in url:
+        add_finding(
+            findings,
+            "URL",
+            "HIGH",
+            f"URL contains '@', which can hide the real destination: {url}"
+        )
+    # ---------------- Excessive subdomains ----------------
+    parts = domain.split(".")
+    if len(parts) >= 5:
+        add_finding(
+            findings,
+            "URL",
+            "MEDIUM",
+            f"URL contains many subdomains: {domain}"
+        )
+    # ---------------- Suspicious keywords ----------------
+    suspicious_words = [
+        "login",
+        "verify",
+        "secure",
+        "account",
+        "update",
+        "password",
+        "confirm",
+        "wallet",
+        "payment",
+        "signin",
+    ]
+    for word in suspicious_words:
+        if word in url.lower():
+            add_finding(
+                findings,
+                "URL",
+                "LOW",
+                f"Suspicious keyword '{word}' found in URL."
+            )
+            break
+# ============================================================
+# Extract URLs
+# ============================================================
+def extract_urls(text):
+    urls = re.findall(
+        r'https?://[^\s<>"\']+',
+        text
+    )
+    return list(set(urls))
+# ============================================================
+# HTML URL extraction
+# ============================================================
+def extract_html_urls(html):
+    urls = []
+    try:
+        soup = BeautifulSoup(
+            html,
+            "html.parser"
+        )
+        for tag in soup.find_all("a"):
+            href = tag.get("href")
+            if href and href.startswith(
+                ("http://", "https://")
+            ):
+                urls.append(href)
+    except Exception:
+        pass
+    return urls
+# ============================================================
+# Attachment analysis
+# ============================================================
+def analyze_attachments(msg, findings):
+    print("\n--- ATTACHMENT ANALYSIS ---")
+    found = False
+    for part in msg.walk():
+        filename = part.get_filename()
+        if not filename:
+            continue
+        found = True
+        filename_lower = filename.lower()
+        print("Attachment:", filename)
+        # Dangerous extension
+        for extension in DANGEROUS_EXTENSIONS:
+            if filename_lower.endswith(extension):
+                add_finding(
+                    findings,
+                    "ATTACHMENT",
+                    "HIGH",
+                    f"Dangerous attachment type detected: {filename}"
+                )
+        # Double extension
+        if re.search(
+            r'\.(pdf|docx?|xlsx?|jpg|png)\.(exe|scr|js|vbs|bat|cmd)$',
+            filename_lower
+        ):
+            add_finding(
+                findings,
+                "ATTACHMENT",
+                "CRITICAL",
+                f"Possible double-extension attack: {filename}"
+            )
+        # Macro-enabled Office files
+        if filename_lower.endswith(
+            (".docm", ".xlsm", ".pptm")
+        ):
+            add_finding(
+                findings,
+                "ATTACHMENT",
+                "HIGH",
+                f"Macro-enabled Office document detected: {filename}"
+            )
+    if not found:
+        print("No attachments found.")
+# ============================================================
+# Social engineering analysis
+# ============================================================
+def analyze_social_engineering(text, findings):
+    print("\n--- SOCIAL ENGINEERING ANALYSIS ---")
+    text_lower = text.lower()
+    detected = set()
+    for category, patterns in SOCIAL_ENGINEERING_PATTERNS.items():
+        for pattern in patterns:
+            if pattern in text_lower:
+                if category not in detected:
+                    add_finding(
+                        findings,
+                        "SOCIAL ENGINEERING",
+                        "MEDIUM",
+                        f"{category} language detected: '{pattern}'"
+                    )
+                    detected.add(category)
+                break
+    if not detected:
+        print("No obvious social-engineering patterns detected.")
+# ============================================================
+# Email body extraction
+# ============================================================
+def extract_body(msg):
+    plain_text = ""
+    html_text = ""
+    for part in msg.walk():
+        content_type = part.get_content_type()
+        if content_type == "text/plain":
+            try:
+                plain_text += part.get_content()
+            except Exception:
+                pass
+        elif content_type == "text/html":
+            try:
+                html_text += part.get_content()
+            except Exception:
+                pass
+    return plain_text, html_text
+# ============================================================
+# Risk score
+# ============================================================
+def calculate_score(findings):
+    score = 0
+    severity_points = {
+        "LOW": 5,
+        "MEDIUM": 15,
+        "HIGH": 25,
+        "CRITICAL": 40,
+    }
+    for finding in findings:
+        score += severity_points.get(
+            finding["severity"],
+            0
+        )
+    # Limit score
+    return min(score, 100)
+def get_risk_level(score):
+    if score >= 75:
+        return "CRITICAL"
+    elif score >= 50:
+        return "HIGH"
+    elif score >= 25:
+        return "MEDIUM"
+    else:
+        return "LOW"
+# ============================================================
+# Main analyzer
+# ============================================================
+def analyze_email(file_path):
+    print("=" * 70)
+    print("             PHISHING EMAIL DETECTOR")
+    print("=" * 70)
+    findings = []
+    # --------------------------------------------------------
+    # Parse EML
+    # --------------------------------------------------------
+    try:
+        with open(
+            file_path,
+            "rb"
+        ) as file:
+            msg = BytesParser(
+                policy=policy.default
+            ).parse(file)
+    except Exception as error:
+        print("Error reading email:")
+        print(error)
+        return
+    # --------------------------------------------------------
+    # Basic information
+    # --------------------------------------------------------
+    print("\n--- EMAIL INFORMATION ---")
+    print(
+        "From   :",
+        msg.get("From", "Unknown")
+    )
+    print(
+        "To     :",
+        msg.get("To", "Unknown")
+    )
+    print(
+        "Subject:",
+        msg.get("Subject", "Unknown")
+    )
+    print(
+        "Date   :",
+        msg.get("Date", "Unknown")
+    )
+    # --------------------------------------------------------
+    # Authentication
+    # --------------------------------------------------------
+    print("\n--- AUTHENTICATION ---")
+    analyze_authentication(
+        msg,
+        findings
+    )
+    # --------------------------------------------------------
+    # Headers
+    # --------------------------------------------------------
+    analyze_headers(
+        msg,
+        findings
+    )
+    # --------------------------------------------------------
+    # Body
+    # --------------------------------------------------------
+    plain_text, html_text = extract_body(
+        msg
+    )
+    combined_text = (
+        plain_text +
+        "\n" +
+        html_text
+    )
+    # --------------------------------------------------------
+    # Social engineering
+    # --------------------------------------------------------
+    analyze_social_engineering(
+        combined_text,
+        findings
+    )
+    # --------------------------------------------------------
+    # URLs from plain text
+    # --------------------------------------------------------
+    print("\n--- URL ANALYSIS ---")
+    urls = extract_urls(
+        combined_text
+    )
+    # URLs from HTML
+    html_urls = extract_html_urls(
+        html_text
+    )
+    urls.extend(html_urls)
+    urls = list(set(urls))
+    if urls:
+        print(
+            f"Found {len(urls)} URL(s)"
+        )
+        for url in urls:
+            print("\nChecking:", url)
+            analyze_url(
+                url,
+                findings
+            )
+    else:
+        print("No URLs found.")
+    # --------------------------------------------------------
+    # Attachments
+    # --------------------------------------------------------
+    analyze_attachments(
+        msg,
+        findings
+    )
+    # --------------------------------------------------------
+    # Final report
+    # --------------------------------------------------------
+    score = calculate_score(
+        findings
+    )
+    risk = get_risk_level(
+        score
+    )
+    print("\n")
+    print("=" * 70)
+    print("                    FINAL REPORT")
+    print("=" * 70)
+    print(
+        f"\nRisk Score : {score}/100"
+    )
+    print(
+        f"Risk Level : {risk}"
+    )
+    # --------------------------------------------------------
+    # Findings
+    # --------------------------------------------------------
+    if findings:
+        print("\n--- DETECTION FINDINGS ---")
+        for number, finding in enumerate(
+            findings,
+            start=1
+        ):
+            print(
+                f"\n[{number}] "
+                f"{finding['severity']} | "
+                f"{finding['category']}"
+            )
+            print(
+                f"    {finding['message']}"
+            )
+    else:
+        print(
+            "\nNo suspicious indicators detected."
+        )
+    print("\n")
+    print("=" * 70)
+    print(
+        "SOC Analyst Summary:"
+    )
+    if risk == "CRITICAL":
+        print(
+            "Highly suspicious email. "
+            "Multiple phishing indicators detected."
+        )
+    elif risk == "HIGH":
+        print(
+            "High-risk email. "
+            "Further investigation is recommended."
+        )
+    elif risk == "MEDIUM":
+        print(
+            "Potentially suspicious email. "
+            "Manual investigation recommended."
+        )
+    else:
+        print(
+            "No major phishing indicators detected."
+        )
+    print("=" * 70)
+# ============================================================
+# Program entry point
+# ============================================================
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print(
+            "\nUsage:"
+        )
+        print(
+            "python phishing_detector.py suspicious_email.eml"
+        )
+        sys.exit(1)
+    analyze_email(
+        sys.argv[1]
+    )
