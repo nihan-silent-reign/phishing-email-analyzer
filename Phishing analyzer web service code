@@ -1,0 +1,442 @@
+import streamlit as st
+import email
+import re
+import ipaddress
+from email import policy
+from urllib.parse import urlparse
+from bs4 import BeautifulSoup
+# -----------------------------
+# Configuration
+# -----------------------------
+BRANDS = [
+    "google",
+    "microsoft",
+    "apple",
+    "amazon",
+    "paypal",
+    "facebook",
+    "instagram",
+    "netflix",
+    "linkedin",
+    "github",
+    "hdfc",
+    "sbi",
+    "icici",
+]
+DANGEROUS_EXTENSIONS = [
+    ".exe", ".scr", ".bat", ".cmd", ".vbs",
+    ".js", ".jar", ".msi", ".dll",
+    ".docm", ".xlsm", ".pptm"
+]
+URL_SHORTENERS = [
+    "bit.ly",
+    "tinyurl.com",
+    "t.co",
+    "goo.gl",
+    "ow.ly",
+    "is.gd",
+]
+SOCIAL_ENGINEERING_WORDS = [
+    "urgent",
+    "immediately",
+    "verify your account",
+    "account suspended",
+    "account blocked",
+    "click here",
+    "password expired",
+    "confirm your identity",
+    "payment failed",
+    "action required",
+]
+# -----------------------------
+# Helper functions
+# -----------------------------
+def levenshtein(a, b):
+    """Calculate similarity distance between two strings."""
+    if len(a) < len(b):
+        return levenshtein(b, a)
+    if len(b) == 0:
+        return len(a)
+    previous_row = range(len(b) + 1)
+    for i, c1 in enumerate(a):
+        current_row = [i + 1]
+        for j, c2 in enumerate(b):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(
+                min(insertions, deletions, substitutions)
+            )
+        previous_row = current_row
+    return previous_row[-1]
+def analyze_headers(msg, findings):
+    """Analyze important email headers."""
+    from_header = msg.get("From", "")
+    reply_to = msg.get("Reply-To", "")
+    return_path = msg.get("Return-Path", "")
+    findings.append({
+        "category": "Header",
+        "finding": f"From: {from_header}"
+    })
+    if reply_to:
+        findings.append({
+            "category": "Header",
+            "finding": f"Reply-To: {reply_to}"
+        })
+    if return_path:
+        findings.append({
+            "category": "Header",
+            "finding": f"Return-Path: {return_path}"
+        })
+    # Basic From / Reply-To mismatch
+    if reply_to and from_header:
+        from_domain = from_header.split("@")[-1].replace(">", "").strip()
+        reply_domain = reply_to.split("@")[-1].replace(">", "").strip()
+        if from_domain.lower() != reply_domain.lower():
+            findings.append({
+                "category": "Header",
+                "finding": "From and Reply-To domains are different",
+                "risk": 2
+            })
+def analyze_authentication(msg, findings):
+    """Read SPF, DKIM and DMARC results from email headers."""
+    auth_results = msg.get("Authentication-Results", "")
+    received_spf = msg.get("Received-SPF", "")
+    auth_text = (auth_results + " " + received_spf).lower()
+    # SPF
+    if "spf=pass" in auth_text:
+        findings.append({
+            "category": "SPF",
+            "finding": "SPF PASS"
+        })
+    elif "spf=fail" in auth_text:
+        findings.append({
+            "category": "SPF",
+            "finding": "SPF FAIL",
+            "risk": 3
+        })
+    else:
+        findings.append({
+            "category": "SPF",
+            "finding": "SPF result not found"
+        })
+    # DKIM
+    if "dkim=pass" in auth_text:
+        findings.append({
+            "category": "DKIM",
+            "finding": "DKIM PASS"
+        })
+    elif "dkim=fail" in auth_text:
+        findings.append({
+            "category": "DKIM",
+            "finding": "DKIM FAIL",
+            "risk": 3
+        })
+    else:
+        findings.append({
+            "category": "DKIM",
+            "finding": "DKIM result not found"
+        })
+    # DMARC
+    if "dmarc=pass" in auth_text:
+        findings.append({
+            "category": "DMARC",
+            "finding": "DMARC PASS"
+        })
+    elif "dmarc=fail" in auth_text:
+        findings.append({
+            "category": "DMARC",
+            "finding": "DMARC FAIL",
+            "risk": 3
+        })
+    else:
+        findings.append({
+            "category": "DMARC",
+            "finding": "DMARC result not found"
+        })
+def analyze_urls(text, findings):
+    """Analyze URLs found in email."""
+    urls = re.findall(r'https?://[^\s<>"\']+', text)
+    for url in urls:
+        clean_url = url.rstrip(".,);]")
+        try:
+            parsed = urlparse(clean_url)
+            hostname = parsed.hostname or ""
+            # HTTP
+            if parsed.scheme == "http":
+                findings.append({
+                    "category": "URL",
+                    "finding": f"HTTP URL: {clean_url}",
+                    "risk": 1
+                })
+            # IP address
+            try:
+                ipaddress.ip_address(hostname)
+                findings.append({
+                    "category": "URL",
+                    "finding": f"URL uses IP address: {clean_url}",
+                    "risk": 3
+                })
+            except ValueError:
+                pass
+            # Punycode
+            if "xn--" in hostname.lower():
+                findings.append({
+                    "category": "Punycode",
+                    "finding": f"Punycode domain detected: {hostname}",
+                    "risk": 3
+                })
+            # URL shortener
+            if hostname.lower() in URL_SHORTENERS:
+                findings.append({
+                    "category": "URL",
+                    "finding": f"URL shortener detected: {hostname}",
+                    "risk": 2
+                })
+            # @ symbol
+            if "@" in clean_url:
+                findings.append({
+                    "category": "URL",
+                    "finding": f"@ symbol found in URL: {clean_url}",
+                    "risk": 2
+                })
+            # Suspicious words
+            suspicious_words = [
+                "login",
+                "verify",
+                "secure",
+                "update",
+                "password",
+                "payment",
+                "account",
+            ]
+            for word in suspicious_words:
+                if word in clean_url.lower():
+                    findings.append({
+                        "category": "URL",
+                        "finding": f"Suspicious keyword '{word}' in URL",
+                        "risk": 1
+                    })
+        except Exception:
+            pass
+    return urls
+def analyze_punycode_and_typosquatting(text, findings):
+    """Check suspicious domains for punycode and brand similarity."""
+    domains = re.findall(
+        r'(?:https?://)?(?:www\.)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
+        text
+    )
+    for domain in domains:
+        domain_lower = domain.lower()
+        # Punycode
+        if "xn--" in domain_lower:
+            findings.append({
+                "category": "Punycode",
+                "finding": f"Punycode detected: {domain}",
+                "risk": 3
+            })
+        domain_name = domain_lower.split(".")[0]
+        for brand in BRANDS:
+            distance = levenshtein(domain_name, brand)
+            if distance == 1 and domain_name != brand:
+                findings.append({
+                    "category": "Typosquatting",
+                    "finding": (
+                        f"Possible typosquatting: "
+                        f"{domain} resembles {brand}"
+                    ),
+                    "risk": 3
+                })
+def analyze_attachments(msg, findings):
+    """Analyze email attachments."""
+    for part in msg.walk():
+        filename = part.get_filename()
+        if not filename:
+            continue
+        filename_lower = filename.lower()
+        findings.append({
+            "category": "Attachment",
+            "finding": f"Attachment found: {filename}"
+        })
+        # Dangerous extensions
+        for extension in DANGEROUS_EXTENSIONS:
+            if filename_lower.endswith(extension):
+                findings.append({
+                    "category": "Attachment",
+                    "finding": (
+                        f"Dangerous attachment extension: "
+                        f"{filename}"
+                    ),
+                    "risk": 4
+                })
+        # Double extension
+        if re.search(
+            r'\.(pdf|doc|docx|jpg|png|txt)\.(exe|scr|bat|cmd|js)$',
+            filename_lower
+        ):
+            findings.append({
+                "category": "Attachment",
+                "finding": (
+                    f"Possible double-extension attack: "
+                    f"{filename}"
+                ),
+                "risk": 4
+            })
+def analyze_social_engineering(text, findings):
+    """Detect common social engineering language."""
+    lower_text = text.lower()
+    for phrase in SOCIAL_ENGINEERING_WORDS:
+        if phrase in lower_text:
+            findings.append({
+                "category": "Social Engineering",
+                "finding": f"Suspicious phrase detected: '{phrase}'",
+                "risk": 2
+            })
+def calculate_risk(findings):
+    """Calculate overall risk score."""
+    score = 0
+    for finding in findings:
+        score += finding.get("risk", 0)
+    if score >= 10:
+        level = "CRITICAL"
+    elif score >= 6:
+        level = "HIGH"
+    elif score >= 3:
+        level = "MEDIUM"
+    else:
+        level = "LOW"
+    return score, level
+# -----------------------------
+# Main email analyzer
+# -----------------------------
+def analyze_email(file_data):
+    msg = email.message_from_bytes(
+        file_data,
+        policy=policy.default
+    )
+    findings = []
+    # Headers
+    analyze_headers(msg, findings)
+    # SPF / DKIM / DMARC
+    analyze_authentication(msg, findings)
+    # Get email text
+    body_text = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            if content_type == "text/plain":
+                try:
+                    body_text += part.get_content()
+                except Exception:
+                    pass
+            elif content_type == "text/html":
+                try:
+                    html = part.get_content()
+                    soup = BeautifulSoup(html, "html.parser")
+                    body_text += soup.get_text(" ")
+                except Exception:
+                    pass
+    else:
+        try:
+            body_text = msg.get_content()
+        except Exception:
+            body_text = ""
+    # URL analysis
+    analyze_urls(body_text, findings)
+    # Punycode + typosquatting
+    analyze_punycode_and_typosquatting(body_text, findings)
+    # Attachments
+    analyze_attachments(msg, findings)
+    # Social engineering
+    analyze_social_engineering(body_text, findings)
+    # Risk
+    score, level = calculate_risk(findings)
+    return msg, findings, score, level
+# ==========================================================
+# STREAMLIT WEB INTERFACE
+# ==========================================================
+st.set_page_config(
+    page_title="Phishing Email Detector",
+    page_icon="🛡️",
+    layout="wide"
+)
+st.title("🛡️ Phishing Email Detector")
+st.write(
+    "Upload an `.eml` email file and analyze it for "
+    "common phishing indicators."
+)
+uploaded_file = st.file_uploader(
+    "Upload suspicious email",
+    type=["eml"]
+)
+if uploaded_file is not None:
+    st.success(
+        f"File uploaded: {uploaded_file.name}"
+    )
+    if st.button("🔍 Analyze Email"):
+        try:
+            file_data = uploaded_file.read()
+            msg, findings, score, level = analyze_email(
+                file_data
+            )
+            st.divider()
+            # -------------------------
+            # Risk result
+            # -------------------------
+            st.subheader("🚨 Risk Assessment")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric(
+                    "Risk Score",
+                    score
+                )
+            with col2:
+                st.metric(
+                    "Risk Level",
+                    level
+                )
+            # -------------------------
+            # Email information
+            # -------------------------
+            st.subheader("📧 Email Information")
+            st.write(
+                "**From:**",
+                msg.get("From", "Not available")
+            )
+            st.write(
+                "**To:**",
+                msg.get("To", "Not available")
+            )
+            st.write(
+                "**Subject:**",
+                msg.get("Subject", "Not available")
+            )
+            # -------------------------
+            # Findings
+            # -------------------------
+            st.subheader("🔎 Security Findings")
+            if not findings:
+                st.success(
+                    "No suspicious indicators detected."
+                )
+            else:
+                for finding in findings:
+                    category = finding["category"]
+                    description = finding["finding"]
+                    risk = finding.get("risk", 0)
+                    if risk >= 3:
+                        st.error(
+                            f"🔴 **{category}** — {description}"
+                        )
+                    elif risk >= 1:
+                        st.warning(
+                            f"🟠 **{category}** — {description}"
+                        )
+                    else:
+                        st.info(
+                            f"🔵 **{category}** — {description}"
+                        )
+        except Exception as e:
+            st.error(
+                f"Error analyzing email: {e}"
+            )
