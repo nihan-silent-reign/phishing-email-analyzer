@@ -1,0 +1,86 @@
+import chromadb
+from sentence_transformers import SentenceTransformer
+import ollama
+
+# -----------------------------
+# 1. Load embedding model
+# -----------------------------
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# -----------------------------
+# 2. Connect to ChromaDB
+# -----------------------------
+client = chromadb.PersistentClient(path="./chroma_db")
+
+collection = client.get_collection(
+    name="phishing_knowledge"
+)
+
+# -----------------------------
+# 3. Ask the user
+# -----------------------------
+question = input("\nAsk your phishing AI: ")
+
+# -----------------------------
+# 4. Convert question to embedding
+# -----------------------------
+question_embedding = model.encode(question).tolist()
+
+# -----------------------------
+# 5. Retrieve relevant information
+# -----------------------------
+results = collection.query(
+    query_embeddings=[question_embedding],
+    n_results=3
+)
+
+documents = results["documents"][0]
+
+# Combine retrieved information
+context = "\n\n".join(documents)
+
+# -----------------------------
+# 6. Create prompt for LLM
+# -----------------------------
+prompt = f"""
+You are a cybersecurity assistant specializing in phishing email analysis.
+
+Use the knowledge provided below to answer the user's question.
+
+KNOWLEDGE BASE:
+{context}
+
+USER QUESTION:
+{question}
+
+Instructions:
+- Answer clearly and accurately.
+- Prefer information from the knowledge base.
+- If the knowledge base does not contain enough information, say so.
+- Do not invent facts.
+- Explain technical terms simply when appropriate.
+"""
+
+# -----------------------------
+# 7. Send context + question to LLM
+# -----------------------------
+response = ollama.chat(
+    model="llama3.2",
+    messages=[
+        {
+            "role": "user",
+            "content": prompt
+        }
+    ]
+)
+
+# -----------------------------
+# 8. Display AI answer
+# -----------------------------
+print("\n==============================")
+print("🤖 PHISHING AI")
+print("==============================\n")
+
+print(response["message"]["content"])
+
+print("\n==============================")
